@@ -55,9 +55,11 @@ The API never waits for a DM API call in the webhook request. It records the eve
 
 1. Create a Supabase Postgres project and copy its **Session Pooler** connection string, including SSL.
 2. Push this repository to GitHub and create a Render Blueprint from `render.yaml`.
-3. In both Render services, set `DATABASE_URL` and `PSEUDOGRAM_API_KEY` as secrets. Keep signature verification enabled.
+3. The included Blueprint uses one **free Render Web Service** and runs the API and worker together. Set `DATABASE_URL` and `PSEUDOGRAM_API_KEY` as secrets; keep signature verification enabled.
 4. Render creates a public URL for the Web Service. Use `<render-url>/webhook` as `webhook_url` for `POST /v1/simulate/start`.
 5. Create rules, run the 500-comment simulator, then compare results with `GET /v1/simulate/{run_id}/truth`.
+
+> Free Render services sleep after 15 minutes without incoming traffic. This mode is appropriate for development and short simulator runs, but a dedicated worker is required for fully reliable long-running production delivery.
 
 ## Environment variables
 
@@ -69,4 +71,3 @@ The API never waits for a DM API call in the webhook request. It records the eve
 | `DM_MAX_ATTEMPTS` | Total outbound delivery attempts; default `5` |
 | `WORKER_POLL_SECONDS` | Idle worker poll interval; default `0.5` |
 | `RECONCILE_INITIAL_SECONDS` | First delivery-status poll delay; default `5` |
-

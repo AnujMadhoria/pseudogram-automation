@@ -1,8 +1,9 @@
 services:
   - type: web
-    name: pseudogram-automation-api
+    name: pseudogram-automation-free
     runtime: docker
-    dockerCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    plan: free
+    dockerCommand: sh start-free-render.sh
     healthCheckPath: /health
     envVars:
       - key: DATABASE_URL
@@ -11,16 +12,3 @@ services:
         sync: false
       - key: WEBHOOK_SIGNATURE_REQUIRED
         value: "true"
-
-  - type: worker
-    name: pseudogram-automation-worker
-    runtime: docker
-    dockerCommand: python -m app.worker
-    envVars:
-      - key: DATABASE_URL
-        sync: false
-      - key: PSEUDOGRAM_API_KEY
-        sync: false
-      - key: WEBHOOK_SIGNATURE_REQUIRED
-        value: "true"
-
