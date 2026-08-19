@@ -1,73 +1,81 @@
-# PseudoGram Comment-to-DM Automation
+# PseudoGram Comment-to-DM Automation — Part A
 
-A reliable implementation of the LinkPlease assignment. A comment matching a creator rule is turned into one durable DM job per `(rule, user)`, then a worker sends and reconciles it with the hostile PseudoGram API.
+This project implements the required Part A of the LinkPlease assignment: a creator creates a keyword rule, comments are matched against it, and a reliable background worker sends one DM per rule/user.
 
-## Architecture
+## What happens
 
 ```text
-PseudoGram → POST /webhook → PostgreSQL events + jobs → worker → PseudoGram DM API
-                                      ↓
-                           GET /stats reads durable state
+PseudoGram comment webhook
+  → FastAPI validates and saves the event
+  → PostgreSQL creates a durable DM job
+  → worker sends the DM with retry and idempotency protection
+  → GET /stats reports the final Part A send state
 ```
 
-The API never waits for a DM API call in the webhook request. It records the event and queue state transactionally, responds quickly, and lets the worker perform sends and retries.
+The webhook never waits for the DM API call. It saves work first and returns `200` quickly.
 
 ## Required endpoints
 
-- `POST /rules` creates `{ "keyword": "PRICE", "dm_message": "..." }` and returns `201`.
-- `POST /webhook` verifies the PseudoGram HMAC signature and records `comment.created` or `comment.deleted` events.
-- `GET /stats` returns confirmed deliveries, permanent failures, active work, and durable duplicate-block decisions.
-- `GET /health` is used by Render.
+- `POST /rules`
 
-## Reliability guarantees
+  ```json
+  { "keyword": "PRICE", "dm_message": "Here is the price list." }
+  ```
 
-- `event_id` is a primary key, so redelivered webhooks do not create duplicate work.
-- `(rule_id, recipient_user_id)` is unique in PostgreSQL, which prevents concurrent duplicate DMs.
-- Every outbound send uses an `Idempotency-Key`; a crash or network timeout repeats the same logical attempt safely.
-- A Postgres advisory lock and persisted rolling request log limit sends to 10 per 60 seconds.
-- `500` and network errors retry with bounded exponential backoff. `429` obeys `Retry-After`. `400` fails immediately.
-- A `202 Accepted` result is not counted as sent. The worker polls its DM status until it is delivered or fails, then retries failed deliveries within the configured budget.
-- A deletion tombstone prevents a late `comment.created` event from causing a DM. Queued unsent jobs for deleted comments are cancelled.
+  Returns `201` with `rule_id`, `keyword`, and `dm_message`.
+
+- `POST /webhook`
+
+  Receives `comment.created` events. Matching is case-insensitive and works anywhere in the comment text.
+
+- `GET /stats`
+
+  ```json
+  { "sent": 0, "failed": 0, "queued": 0, "duplicates_blocked": 0 }
+  ```
+
+- `GET /health`
+
+  Used only by Render to check that the application is alive.
+
+## Part A reliability guarantees
+
+- A duplicate `event_id` is ignored.
+- A database unique constraint prevents the same `(rule, user)` pair from receiving two DMs.
+- Every matching DM is stored in PostgreSQL before a send is attempted.
+- The worker retries network errors and `500` responses up to five attempts.
+- `429` waits for the API-provided retry time.
+- A persisted rate log stays within PseudoGram's 10-send-per-60-second limit.
+- Every retry uses the same idempotency key, so an uncertain network failure cannot create a duplicate DM.
+
+For Part A, a successful `2xx` response from the mock DM API is counted as `sent`. The live mock returns `200` although the brief documents `202`, so both are supported.
+
+## Deliberately out of scope
+
+- Webhook signature verification
+- Delivery-status polling after the mock accepts a DM
+- Retrying DMs that fail later after initial acceptance
+- Comment-deletion behavior
+
+Those are Part B/C features. `comment.deleted` webhooks are accepted and recorded but do not create a DM job.
 
 ## Local setup
 
-1. Copy `.env.example` to `.env` and set `PSEUDOGRAM_API_KEY`. Never commit `.env`.
-2. Start the API, worker, and local Postgres:
+1. Copy `.env.example` to `.env` and fill in `PSEUDOGRAM_API_KEY`.
+2. Start local Postgres, API, and worker:
 
    ```powershell
    docker compose up --build
    ```
 
-3. Create a rule:
+3. Run tests:
 
    ```powershell
-   Invoke-RestMethod -Method Post -Uri http://localhost:8000/rules -ContentType application/json -Body '{"keyword":"PRICE","dm_message":"Here is the price list"}'
-   ```
-
-4. Run tests with Python 3.12:
-
-   ```powershell
-   python -m pip install -r requirements.txt
    python -m pytest -q
    ```
 
-## Render + Supabase deployment
+## Render + Supabase
 
-1. Create a Supabase Postgres project and copy its **Session Pooler** connection string, including SSL.
-2. Push this repository to GitHub and create a Render Blueprint from `render.yaml`.
-3. The included Blueprint uses one **free Render Web Service** and runs the API and worker together. Set `DATABASE_URL` and `PSEUDOGRAM_API_KEY` as secrets; keep signature verification enabled.
-4. Render creates a public URL for the Web Service. Use `<render-url>/webhook` as `webhook_url` for `POST /v1/simulate/start`.
-5. Create rules, run the 500-comment simulator, then compare results with `GET /v1/simulate/{run_id}/truth`.
+`render.yaml` creates one free Render Web Service. `start-free-render.sh` starts both the API and worker process in that service. Add `DATABASE_URL` and `PSEUDOGRAM_API_KEY` as Render secrets.
 
-> Free Render services sleep after 15 minutes without incoming traffic. This mode is appropriate for development and short simulator runs, but a dedicated worker is required for fully reliable long-running production delivery.
-
-## Environment variables
-
-| Variable | Purpose |
-| --- | --- |
-| `DATABASE_URL` | PostgreSQL SQLAlchemy connection URL |
-| `PSEUDOGRAM_API_KEY` | Secret used for PseudoGram calls and webhook HMAC verification |
-| `WEBHOOK_SIGNATURE_REQUIRED` | Keep `true` outside isolated local tests |
-| `DM_MAX_ATTEMPTS` | Total outbound delivery attempts; default `5` |
-| `WORKER_POLL_SECONDS` | Idle worker poll interval; default `0.5` |
-| `RECONCILE_INITIAL_SECONDS` | First delivery-status poll delay; default `5` |
+Free Render services can sleep after 15 minutes without incoming traffic, so this deployment is suitable for development and short simulations rather than long-running production queues.

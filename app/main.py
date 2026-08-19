@@ -1,19 +1,15 @@
 import json
-import logging
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response, status
+from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.migrate import run_migrations
-from app.models import DMJob, DuplicateBlock, Rule
+from app.models import DMJob, DuplicateBlock
 from app.schemas import RuleCreate, RuleResponse, StatsResponse, WebhookPayload
-from app.security import signature_is_valid
 from app.services import create_rule, record_webhook
-
-logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
@@ -38,20 +34,14 @@ def post_rule(payload: RuleCreate, session: Session = Depends(get_db)) -> RuleRe
 @app.post("/webhook")
 async def post_webhook(
     request: Request,
-    x_pseudogram_signature: str | None = Header(default=None),
     session: Session = Depends(get_db),
 ) -> Response:
     raw_body = await request.body()
-    if not signature_is_valid(raw_body, x_pseudogram_signature):
-        logger.warning("webhook rejected: invalid signature; body_bytes=%s", len(raw_body))
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid webhook signature")
     try:
         raw_payload = json.loads(raw_body)
         payload = WebhookPayload.model_validate(raw_payload)
         record_webhook(session, payload, raw_payload)
-        logger.info("webhook accepted: event_id=%s event_type=%s", payload.event_id, payload.event_type)
     except ValueError as exc:
-        logger.warning("webhook rejected: invalid payload; detail=%s", exc)
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
     return Response(status_code=status.HTTP_200_OK)
 
@@ -62,8 +52,8 @@ def get_stats(session: Session = Depends(get_db)) -> StatsResponse:
         return int(session.scalar(select(func.count()).select_from(DMJob).where(DMJob.status.in_(states))) or 0)
 
     return StatsResponse(
-        sent=count_jobs("delivered"),
+        sent=count_jobs("sent"),
         failed=count_jobs("failed"),
-        queued=count_jobs("queued", "sending", "awaiting_delivery"),
+        queued=count_jobs("queued", "sending"),
         duplicates_blocked=int(session.scalar(select(func.count()).select_from(DuplicateBlock)) or 0),
     )

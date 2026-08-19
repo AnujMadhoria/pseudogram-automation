@@ -1,7 +1,6 @@
 import os
 
 os.environ.setdefault("DATABASE_URL", "sqlite:///./test.sqlite3")
-os.environ.setdefault("WEBHOOK_SIGNATURE_REQUIRED", "false")
 os.environ.setdefault("PSEUDOGRAM_API_KEY", "test-key")
 
 import pytest
@@ -34,4 +33,3 @@ def session():
         yield db
     finally:
         db.close()
-

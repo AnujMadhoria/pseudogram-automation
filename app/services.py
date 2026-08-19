@@ -1,12 +1,11 @@
 import uuid
-from datetime import datetime
 
 import httpx
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.models import Comment, DMJob, DuplicateBlock, Rule, WebhookEvent, utcnow
+from app.models import Comment, DMJob, DuplicateBlock, Rule, WebhookEvent
 from app.schemas import WebhookPayload
 
 
@@ -34,9 +33,7 @@ def record_webhook(session: Session, payload: WebhookPayload, raw_payload: dict)
         )
         session.flush()
 
-        if payload.event_type == "comment.deleted":
-            _record_deletion(session, payload)
-        else:
+        if payload.event_type == "comment.created":
             _record_creation(session, payload)
 
         session.commit()
@@ -50,35 +47,19 @@ def record_webhook(session: Session, payload: WebhookPayload, raw_payload: dict)
         raise
 
 
-def _record_deletion(session: Session, payload: WebhookPayload) -> None:
-    comment = session.get(Comment, payload.data.comment_id)
-    if comment is None:
-        comment = Comment(id=payload.data.comment_id, state="deleted", deleted_at=utcnow())
-        session.add(comment)
-    else:
-        comment.state = "deleted"
-        comment.deleted_at = utcnow()
-
-    jobs = session.scalars(
-        select(DMJob).where(DMJob.comment_id == payload.data.comment_id, DMJob.status == "queued")
-    ).all()
-    for job in jobs:
-        job.status = "cancelled"
-        job.last_error = "comment_deleted_before_send"
-        job.next_attempt_at = utcnow()
-
-
 def _record_creation(session: Session, payload: WebhookPayload) -> None:
     data = payload.data
     if not data.text or not data.from_:
         raise ValueError("comment.created requires data.text and data.from.user_id")
 
     comment = session.get(Comment, data.comment_id)
-    if comment is not None and comment.state == "deleted":
-        return
     if comment is None:
         comment = Comment(id=data.comment_id, state="active", created_at_source=data.created_at)
         session.add(comment)
+    else:
+        # Part A does not act on comment.deleted events; an old tombstone must
+        # not prevent a valid new comment.created event from being processed.
+        comment.state = "active"
 
     text_folded = data.text.casefold()
     rules = session.scalars(select(Rule)).all()
@@ -130,7 +111,3 @@ class PseudoGramClient:
                 "comment_id": comment_id,
             },
         )
-
-    def dm_status(self, dm_id: str) -> httpx.Response:
-        return self._client.get(f"/v1/dm/{dm_id}")
-

@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 from app.config import get_settings
 from app.database import SessionLocal
 from app.migrate import run_migrations
-from app.models import ApiRequestLog, Comment, DMJob, utcnow
+from app.models import ApiRequestLog, DMJob, utcnow
 from app.services import PseudoGramClient
 
 logger = logging.getLogger(__name__)
@@ -21,8 +21,6 @@ RATE_LIMIT_MAX_REQUESTS = 10
 class DMApi(Protocol):
     def send_dm(self, *, recipient_user_id: str, message: str, comment_id: str, idempotency_key: str) -> httpx.Response: ...
 
-    def dm_status(self, dm_id: str) -> httpx.Response: ...
-
 
 def _as_utc(value: datetime) -> datetime:
     return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
@@ -30,11 +28,6 @@ def _as_utc(value: datetime) -> datetime:
 
 def _retry_delay(attempt: int) -> timedelta:
     return timedelta(seconds=min(60, 2 ** min(max(attempt, 1), 5)))
-
-
-def _reconcile_delay(poll_attempt: int) -> timedelta:
-    initial = get_settings().reconcile_initial_seconds
-    return timedelta(seconds=min(60, initial * (2 ** min(poll_attempt, 4))))
 
 
 def _claim_next(session: Session, status_name: str) -> DMJob | None:
@@ -57,60 +50,8 @@ def _take_send_lock(session: Session) -> bool:
 
 
 def process_one(client: DMApi) -> bool:
-    """Process one delivery status check or one send. Returns whether work was claimed."""
-    if _reconcile_one(client):
-        return True
+    """Process one durable Part A send job. Returns whether work was claimed."""
     return _send_one(client)
-
-
-def _reconcile_one(client: DMApi) -> bool:
-    session = SessionLocal()
-    try:
-        job = _claim_next(session, "awaiting_delivery")
-        if job is None:
-            session.rollback()
-            return False
-        now = utcnow()
-        job.poll_attempt += 1
-        try:
-            response = client.dm_status(job.dm_id or "")
-            body = response.json() if response.headers.get("content-type", "").startswith("application/json") else {}
-        except (httpx.RequestError, ValueError) as exc:
-            job.last_error = f"delivery_status_error: {exc}"
-            job.next_attempt_at = now + _reconcile_delay(job.poll_attempt)
-            session.commit()
-            return True
-
-        if response.status_code != 200:
-            job.last_error = f"delivery_status_http_{response.status_code}"
-            job.next_attempt_at = now + _reconcile_delay(job.poll_attempt)
-        elif body.get("status") == "delivered":
-            job.status = "delivered"
-            job.last_error = None
-            job.next_attempt_at = now
-        elif body.get("status") == "failed":
-            if job.delivery_attempt >= get_settings().dm_max_attempts:
-                job.status = "failed"
-                job.last_error = "delivery_failed_after_retry_budget"
-                job.next_attempt_at = now
-            else:
-                job.status = "queued"
-                job.dm_id = None
-                job.idempotency_key = None
-                job.poll_attempt = 0
-                job.last_error = "delivery_failed_retrying"
-                job.next_attempt_at = now + _retry_delay(job.delivery_attempt)
-        else:
-            # The only expected non-terminal state is queued; unknown states are retried safely.
-            job.next_attempt_at = now + _reconcile_delay(job.poll_attempt)
-        session.commit()
-        return True
-    except Exception:
-        session.rollback()
-        logger.exception("delivery reconciliation failed")
-        raise
-    finally:
-        session.close()
 
 
 def _send_one(client: DMApi) -> bool:
@@ -125,14 +66,6 @@ def _send_one(client: DMApi) -> bool:
             return False
 
         now = utcnow()
-        comment = session.get(Comment, job.comment_id)
-        if comment is not None and comment.state == "deleted":
-            job.status = "cancelled"
-            job.last_error = "comment_deleted_before_send"
-            job.next_attempt_at = now
-            session.commit()
-            return True
-
         cutoff = now - RATE_LIMIT_WINDOW
         session.execute(delete(ApiRequestLog).where(ApiRequestLog.requested_at < cutoff - RATE_LIMIT_WINDOW))
         recent = session.scalars(
@@ -182,22 +115,12 @@ def _send_one(client: DMApi) -> bool:
 
 
 def _handle_send_response(job: DMJob, response: httpx.Response, now: datetime) -> None:
-    # The assignment documents 202, while the live mock can return 200 with the
-    # same accepted-DM payload. In either case a dm_id means reconciliation must
-    # continue instead of treating the request as a permanent failure.
+    # Part A treats a successful mock API response as the completed send.
+    # The live mock returns 200 while the brief documents 202, so accept all 2xx.
     if 200 <= response.status_code < 300:
-        try:
-            dm_id = response.json()["dm_id"]
-        except (KeyError, TypeError, ValueError):
-            job.status = "failed"
-            job.last_error = "accepted_response_missing_dm_id"
-            job.next_attempt_at = now
-            return
-        job.status = "awaiting_delivery"
-        job.dm_id = str(dm_id)
-        job.poll_attempt = 0
+        job.status = "sent"
         job.last_error = None
-        job.next_attempt_at = now + timedelta(seconds=get_settings().reconcile_initial_seconds)
+        job.next_attempt_at = now
         return
 
     if response.status_code == 429:
@@ -245,7 +168,12 @@ def run_forever() -> None:
     logger.info("worker started")
     try:
         while True:
-            processed = process_one(client)
+            try:
+                processed = process_one(client)
+            except Exception:
+                logger.exception("worker loop recovered from an unexpected error")
+                time.sleep(1)
+                continue
             if not processed:
                 time.sleep(settings.worker_poll_seconds)
     finally:
