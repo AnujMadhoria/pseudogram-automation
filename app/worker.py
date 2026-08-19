@@ -182,7 +182,10 @@ def _send_one(client: DMApi) -> bool:
 
 
 def _handle_send_response(job: DMJob, response: httpx.Response, now: datetime) -> None:
-    if response.status_code == 202:
+    # The assignment documents 202, while the live mock can return 200 with the
+    # same accepted-DM payload. In either case a dm_id means reconciliation must
+    # continue instead of treating the request as a permanent failure.
+    if 200 <= response.status_code < 300:
         try:
             dm_id = response.json()["dm_id"]
         except (KeyError, TypeError, ValueError):

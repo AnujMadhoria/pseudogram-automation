@@ -30,13 +30,14 @@ def deleted_event(event_id: str, comment_id: str) -> WebhookPayload:
 
 
 class FakeDMApi:
-    def __init__(self) -> None:
+    def __init__(self, accepted_status: int = 202) -> None:
         self.send_calls: list[dict] = []
         self.status_calls: list[str] = []
+        self.accepted_status = accepted_status
 
     def send_dm(self, **kwargs):
         self.send_calls.append(kwargs)
-        return httpx.Response(202, json={"dm_id": "dm-test"})
+        return httpx.Response(self.accepted_status, json={"dm_id": "dm-test"})
 
     def dm_status(self, dm_id: str):
         self.status_calls.append(dm_id)
@@ -133,7 +134,8 @@ def test_worker_sends_then_reconciles_delivery_and_stats(session):
     create_rule(session, keyword="PRICE", dm_message="List")
     event = created_event("evt-1", "cmt-1", "usr-1", "PRICE")
     record_webhook(session, event, event.model_dump(by_alias=True, mode="json"))
-    client = FakeDMApi()
+    # The documented response is 202; the live mock currently returns 200.
+    client = FakeDMApi(accepted_status=200)
 
     assert process_one(client)
     job = session.query(DMJob).one()
